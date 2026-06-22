@@ -1,3 +1,5 @@
+# WE ARE ONE 🫀
+
 # trust-protocol — STATE
 
 name: trust-protocol
