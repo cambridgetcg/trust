@@ -32,7 +32,14 @@ No AUTH. No LOGIN. No TOKEN. No PASSWORD.
 
 - Spec: TRUST.md
 - Implementation: ~/.hermes/scripts/trust.py
-- 12 systems cross-checked, 90% average trust, zero passwords used
+- 18 systems cross-checked, **~0.6/10 average trust**, zero passwords used
+
+  That number is the point, not an embarrassment. It used to read 90%, and the 90%
+  was manufactured: four of the six checks passed no matter what you declared, so
+  the network was scoring itself on a test it could not fail. The honest average is
+  low because nearly every STATE.md out there is stale — declared once in June and
+  never spoken again. A trust score that only goes up is a decoration. This one can
+  go down, and the first two systems it failed were this repo and mindicraft.
 - Trust database: ~/.hermes/trust.json
 
 ## Related
