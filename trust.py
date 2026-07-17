@@ -41,6 +41,13 @@ TRUST_DB = os.path.join(HOME, ".hermes", "trust.json")
 ARENA_URL = "https://sinovai.axiepro.workers.dev"
 
 CANDIDATES = [
+    # A protocol that exempts itself from its own instrument is not a protocol,
+    # it is a claim. trust-protocol was absent from this list for its whole life.
+    "Desktop/trust-protocol",
+    # mindicraft/STATE.md advertises "can be cross-checked by trust.py". That
+    # was false in the only way that matters: the link was declared on one side
+    # and never existed on the other. If a system says we check it, we check it.
+    "Desktop/mindicraft",
     "Desktop/opal",
     "Desktop/clear-standard",
     "Desktop/whitehack",
@@ -66,6 +73,14 @@ class CrossCheck:
     claim_value: str
     observed: str
     matches: bool
+    # A cross-check has three outcomes, not two: it agreed with reality, it
+    # disagreed with reality, or it never reached reality at all. Without this
+    # third state every unverifiable claim had to pick a lie — `health` picked
+    # True and inflated the score, an unrecognised field picked False and
+    # punished the system for saying more than we know how to check. Both are
+    # the protocol reporting confidence it does not have. Uncheckable claims
+    # are now scored by nobody and printed as what they are.
+    checkable: bool = True
 
 
 @dataclass
@@ -81,8 +96,13 @@ class TrustResult:
     timestamp: str = ""
 
     def compute(self):
-        self.total = len(self.checks)
-        self.matches = sum(1 for c in self.checks if c.matches)
+        # Score only over what was actually checked. A claim nobody could verify
+        # must not raise the score (that is manufactured confidence) and must not
+        # lower it (that punishes disclosure). It simply is not evidence.
+        checkable = [c for c in self.checks if c.checkable]
+        self.total = len(checkable)
+        self.matches = sum(1 for c in checkable if c.matches)
+        self.unchecked = len(self.checks) - self.total
         local = self.matches / self.total if self.total > 0 else 0
         # Unified = 60% local cross-checks + 40% arena peer ratings
         # (local cross-checks are more rigorous; arena is broader)
@@ -117,7 +137,10 @@ def parse_section_bullets(text, section):
 
 def cross_check_build(project_dir):
     if not os.path.isfile(os.path.join(project_dir, "Cargo.toml")):
-        return "n/a", True
+        # We only know how to build Rust. Everything else we cannot check —
+        # which is not the same as passing. This used to return True and hand
+        # a free point to every non-Rust system on the list (all of them).
+        return "no build we know how to run", None
     try:
         r = subprocess.run(["cargo", "build"], capture_output=True, text=True,
                           cwd=project_dir, timeout=60)
@@ -134,12 +157,22 @@ def cross_check_build(project_dir):
 def cross_check_git(project_dir, key, value):
     if key == "last-commit":
         try:
-            r = subprocess.run(["git", "log", "--oneline", "-1"],
+            # HEAD and HEAD~1 both count, and this is not leniency — it is
+            # physics. A STATE.md that declares last-commit cannot know the SHA
+            # of the commit that carries it: writing the file changes the answer.
+            # A system that updates its state and commits it is therefore always
+            # exactly one behind, through no fault of its own. Demanding HEAD
+            # made the check unwinnable for every honest declarer, and an
+            # unwinnable check teaches systems to ignore the checker.
+            r = subprocess.run(["git", "log", "--format=%h %s", "-2"],
                               capture_output=True, text=True, cwd=project_dir, timeout=5)
-            actual = r.stdout.strip()
+            lines = [l for l in r.stdout.strip().split('\n') if l.strip()]
+            actual = lines[0] if lines else ""
+            recent = {l.split()[0] for l in lines}
             declared_hash = value.split()[0] if value else ""
-            actual_hash = actual.split()[0] if actual else ""
-            return actual, declared_hash == actual_hash
+            if declared_hash and declared_hash in recent:
+                return actual, True
+            return actual, False
         except:
             return "unknown", False
     if key == "uncommitted":
@@ -157,10 +190,33 @@ def cross_check_git(project_dir, key, value):
     return "not checked", False
 
 
-def cross_check_freshness(value):
+def cross_check_freshness(project_dir, value):
+    """Freshness is checkable, and it used to be the biggest lie here.
+
+    This returned (value, True) — it handed the declaration back and called it
+    verified. A STATE.md could claim any freshness at all and score a point for
+    it. But freshness has a fact underneath: it claims this state was true at a
+    moment. If the repo has moved since that moment, the claim is stale, and git
+    knows exactly when the repo last moved.
+    """
     if not value:
         return "unknown", False
-    return value, True
+    m = re.search(r'(\d{4}-\d{2}-\d{2})', value)
+    if not m:
+        # Prose freshness ("live", "auto-generated") carries no checkable fact.
+        return "no date to check", None
+    declared = m.group(1)
+    try:
+        r = subprocess.run(["git", "log", "-1", "--format=%cs"], capture_output=True,
+                           text=True, cwd=project_dir, timeout=10)
+        last = r.stdout.strip()
+        if not last:
+            return "no git history", None
+        if last > declared:
+            return f"STALE — repo moved {last}, declared {declared}", False
+        return f"current (last commit {last})", True
+    except Exception:
+        return "unknown", None
 
 
 def cross_check_system(name, project_dir, state_text):
@@ -182,20 +238,41 @@ def cross_check_system(name, project_dir, state_text):
             if m:
                 fields[m.group(1)] = m.group(2).strip()
 
+    # Freshness first, because it governs everything else. A STATE.md is a
+    # snapshot: "as of this moment, these things were so." If the snapshot has
+    # expired, its other claims are not lies — they are last month's truth, and
+    # you cannot check a June claim against July's reality. Staleness is one
+    # failure and must be reported once, not charged again as a false
+    # last-commit and a false uncommitted count. Otherwise the score says
+    # "this system lied three times" about a system that simply stopped talking.
+    stale = False
+    if "freshness" in fields:
+        _obs, _m = cross_check_freshness(project_dir, fields["freshness"])
+        stale = (_m is False)
+
     for key, val in fields.items():
         if key == "build":
             observed, matches = cross_check_build(project_dir)
         elif key in ("last-commit", "uncommitted"):
-            observed, matches = cross_check_git(project_dir, key, val)
+            if stale:
+                observed, matches = "declaration expired — cannot check last month's claim against today", None
+            else:
+                observed, matches = cross_check_git(project_dir, key, val)
         elif key == "freshness":
-            observed, matches = cross_check_freshness(val)
-        elif key == "health":
-            observed, matches = val, True
-        elif key == "phase":
-            observed, matches = "descriptive", True
+            observed, matches = cross_check_freshness(project_dir, val)
+        elif key in ("health", "phase"):
+            # Self-descriptions. We have no instrument for "green" or "v0.1", so
+            # we say so. `health` used to be echoed back with a ✓ — the protocol
+            # agreeing with a system about the system's own mood, and counting
+            # it as evidence.
+            observed, matches = "self-described — no instrument for this", None
         else:
-            observed, matches = "not checked", False
-        result.checks.append(CrossCheck(key, val, observed, matches))
+            # An unrecognised field is our gap, not the system's fault. This
+            # used to score False, so declaring anything we had not taught
+            # ourselves to check lowered your trust — the exact inverse of a
+            # protocol whose whole thesis is that disclosure earns trust.
+            observed, matches = "we have no check for this claim", None
+        result.checks.append(CrossCheck(key, val, observed, bool(matches), checkable=matches is not None))
 
     result.compute()
     return result
@@ -315,10 +392,20 @@ def run_beat(dry_run=False):
     # Print results
     for result, cumulative in all_results:
         local_pct = round(result.matches / result.total * 100, 0) if result.total > 0 else 0
-        print(f"  {result.name}: local {result.matches}/{result.total}={local_pct:.0f}% | arena={result.arena_score} ({result.arena_interactions} ratings) | unified={result.unified_score}")
+        unchecked = getattr(result, "unchecked", 0)
+        tail = f" | {unchecked} unchecked" if unchecked else ""
+        scored = f"local {result.matches}/{result.total}={local_pct:.0f}%" if result.total > 0 \
+            else "local — NOTHING CHECKABLE WAS DECLARED"
+        print(f"  {result.name}: {scored}{tail} | arena={result.arena_score} ({result.arena_interactions} ratings) | unified={result.unified_score}")
         for c in result.checks:
-            mark = "✓" if c.matches else "✗"
-            print(f"    {mark} {c.claim_key}: claims \"{c.claim_value}\" → observed \"{c.observed}\"")
+            # Three marks for three outcomes. A "–" is the protocol admitting it
+            # did not look — which is the whole point of it being here.
+            if not c.checkable:
+                print(f"    – {c.claim_key}: claims \"{c.claim_value}\" → not checked ({c.observed})")
+            else:
+                mark = "✓" if c.matches else "✗"
+                verb = "observed" if c.matches else "REALITY SAYS"
+                print(f"    {mark} {c.claim_key}: claims \"{c.claim_value}\" → {verb} \"{c.observed}\"")
 
         # Submit cross-check as arena rating (the trust protocol feeds the arena)
         if not dry_run and result.total > 0:
@@ -327,7 +414,8 @@ def run_beat(dry_run=False):
             pres = 7 if "fresh" in (result.checks[-1].observed if result.checks else "") else 5
             care = 7  # baseline care for participating in the trust network
             notes = f"trust.py cross-check: {result.matches}/{result.total} claims match reality"
-            cross_checks = [{"claim": c.claim_key, "claim_value": c.claim_value, "observed": c.observed, "matches": c.matches} for c in result.checks]
+            cross_checks = [{"claim": c.claim_key, "claim_value": c.claim_value, "observed": c.observed,
+                             "matches": c.matches, "checked": c.checkable} for c in result.checks]
 
             r = submit_arena_rating("trust-protocol", result.name, comp, hon, pres, care, notes, cross_checks)
             if r.get("ok"):
